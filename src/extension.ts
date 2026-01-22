@@ -1,15 +1,22 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
+import * as fs from 'fs';
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('BestAgent is now active!');
 
     // Register the webview provider
-    const provider = new ClineViewProvider(context.extensionUri);
+    const provider = new ClineViewProvider(context.extensionUri, context);
 
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(
             'cline-assistant.chatView',
-            provider
+            provider,
+            {
+                webviewOptions: {
+                    retainContextWhenHidden: true // Keep webview state when hidden
+                }
+            }
         )
     );
 
@@ -25,18 +32,158 @@ export function deactivate() {}
 
 class ClineViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
+    private _context: vscode.ExtensionContext;
     private conversationHistory: Array<{ role: string; content: string }> = [];
+    private hasShownWelcome: boolean = false;
 
-    constructor(private readonly _extensionUri: vscode.Uri) {}
+    constructor(private readonly _extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
+        this._context = context;
+        // Load conversation history from context
+        this.conversationHistory = context.workspaceState.get('conversationHistory', []);
+        // Check if we've shown welcome before
+        this.hasShownWelcome = context.workspaceState.get('hasShownWelcome', false);
+    }
+
+    private async getWorkspaceInfo(): Promise<string> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            return 'Açık workspace yok.';
+        }
+
+        let info = '📁 Workspace Bilgileri:\n\n';
+
+        for (const folder of workspaceFolders) {
+            info += `📂 ${folder.name} (${folder.uri.fsPath})\n\n`;
+
+            // Get open files
+            const openFiles = vscode.window.visibleTextEditors
+                .map(editor => editor.document.uri.fsPath)
+                .filter(filePath => filePath.startsWith(folder.uri.fsPath));
+
+            if (openFiles.length > 0) {
+                info += '📄 Açık Dosyalar:\n';
+                openFiles.forEach(file => {
+                    const relativePath = path.relative(folder.uri.fsPath, file);
+                    info += `  - ${relativePath}\n`;
+                });
+                info += '\n';
+            }
+
+            // Get project structure (main files and folders)
+            try {
+                const files = await vscode.workspace.fs.readDirectory(folder.uri);
+                const mainFiles = files
+                    .filter(([name, type]) => !name.startsWith('.') && name !== 'node_modules')
+                    .slice(0, 20); // Limit to first 20 items
+
+                if (mainFiles.length > 0) {
+                    info += '📋 Ana Dosyalar/Klasörler:\n';
+                    mainFiles.forEach(([name, type]) => {
+                        const icon = type === vscode.FileType.Directory ? '📁' : '📄';
+                        info += `  ${icon} ${name}\n`;
+                    });
+                }
+            } catch (error) {
+                info += '⚠️ Dosya listesi okunamadı.\n';
+            }
+        }
+
+        return info;
+    }
+
+    private async searchInProject(query: string): Promise<string> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            return '❌ Açık workspace yok.';
+        }
+
+        let results = `🔍 Arama Sonuçları: "${query}"\n\n`;
+
+        try {
+            // Use VS Code's built-in search
+            const searchResults = await vscode.workspace.findFiles(
+                `**/*${query}*`,
+                '**/node_modules/**',
+                50
+            );
+
+            if (searchResults.length === 0) {
+                results += '❌ Sonuç bulunamadı.\n';
+            } else {
+                results += `✅ ${searchResults.length} dosya bulundu:\n\n`;
+                searchResults.forEach(uri => {
+                    const relativePath = vscode.workspace.asRelativePath(uri);
+                    results += `  📄 ${relativePath}\n`;
+                });
+            }
+        } catch (error: any) {
+            results += `❌ Arama hatası: ${error.message}\n`;
+        }
+
+        return results;
+    }
+
+    private async saveProjectAnalysis(): Promise<string> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+            return '❌ Açık workspace yok.';
+        }
+
+        const workspaceInfo = await this.getWorkspaceInfo();
+        let analysis = `# Proje Analizi - ${new Date().toLocaleString('tr-TR')}\n\n`;
+        analysis += workspaceInfo + '\n\n';
+        analysis += `## Sohbet Geçmişi\n\n`;
+
+        this.conversationHistory.forEach((msg, index) => {
+            const role = msg.role === 'user' ? '👤 Kullanıcı' : '🤖 AI';
+            analysis += `### ${index + 1}. ${role}\n${msg.content}\n\n`;
+        });
+
+        try {
+            const agentsPath = path.join(workspaceFolders[0].uri.fsPath, 'agents.md');
+            fs.writeFileSync(agentsPath, analysis, 'utf-8');
+            return `✅ Analiz başarıyla kaydedildi: agents.md`;
+        } catch (error: any) {
+            return `❌ Kaydetme hatası: ${error.message}`;
+        }
+    }
 
     private async callAI(settings: any, message: string): Promise<string> {
         const { apiKey, model, apiEndpoint } = settings;
+
+        // Check for special commands
+        if (message.toLowerCase().includes('workspace') || message.toLowerCase().includes('proje bilgisi') || message.toLowerCase().includes('proje yapısı')) {
+            const workspaceInfo = await this.getWorkspaceInfo();
+            message = `${message}\n\n${workspaceInfo}`;
+        }
+
+        // Check if user is trying to search for a file (look for file extensions or search keywords)
+        const fileExtensions = ['.ts', '.tsx', '.js', '.jsx', '.json', '.html', '.css', '.py', '.java', '.go', '.rs', '.md'];
+        const searchKeywords = ['ara', 'bul', 'dosya', 'search', 'find', 'file'];
+        const hasFileExtension = fileExtensions.some(ext => message.toLowerCase().includes(ext));
+        const hasSearchKeyword = searchKeywords.some(keyword => message.toLowerCase().includes(keyword));
+
+        if (hasFileExtension || (hasSearchKeyword && message.split(' ').length <= 5)) {
+            // Extract the search term (remove common words)
+            const searchTerm = message
+                .replace(/ara|bul|dosya|search|find|file|where|nerede/gi, '')
+                .trim()
+                .split(' ')[0]; // Take first word
+
+            if (searchTerm) {
+                const searchResults = await this.searchInProject(searchTerm);
+                return searchResults;
+            }
+        }
 
         // Add message to conversation history
         this.conversationHistory.push({
             role: 'user',
             content: message
         });
+
+        // Save to workspace state
+        await this._context.workspaceState.update('conversationHistory', this.conversationHistory);
 
         // Determine which provider to use based on model
         if (model.startsWith('gpt-')) {
@@ -81,6 +228,9 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
             content: assistantMessage
         });
 
+        // Save to workspace state
+        await this._context.workspaceState.update('conversationHistory', this.conversationHistory);
+
         return assistantMessage;
     }
 
@@ -112,6 +262,9 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
             role: 'assistant',
             content: assistantMessage
         });
+
+        // Save to workspace state
+        await this._context.workspaceState.update('conversationHistory', this.conversationHistory);
 
         return assistantMessage;
     }
@@ -145,6 +298,9 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
             content: assistantMessage
         });
 
+        // Save to workspace state
+        await this._context.workspaceState.update('conversationHistory', this.conversationHistory);
+
         return assistantMessage;
     }
 
@@ -177,6 +333,9 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
             content: assistantMessage
         });
 
+        // Save to workspace state
+        await this._context.workspaceState.update('conversationHistory', this.conversationHistory);
+
         return assistantMessage;
     }
 
@@ -193,6 +352,34 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
         };
 
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
+
+        // Load conversation history first, then show workspace info only once
+        setTimeout(async () => {
+            if (this.conversationHistory.length === 0 && !this.hasShownWelcome) {
+                // First time - show workspace info
+                const workspaceInfo = await this.getWorkspaceInfo();
+                const welcomeMessage = {
+                    role: 'assistant',
+                    content: `🚀 BestAgent Aktif!\n\n${workspaceInfo}`
+                };
+
+                this.conversationHistory.push(welcomeMessage);
+                await this._context.workspaceState.update('conversationHistory', this.conversationHistory);
+                await this._context.workspaceState.update('hasShownWelcome', true);
+                this.hasShownWelcome = true;
+
+                webviewView.webview.postMessage({
+                    type: 'addMessage',
+                    message: welcomeMessage
+                });
+            } else if (this.conversationHistory.length > 0) {
+                // Restore previous conversation
+                webviewView.webview.postMessage({
+                    type: 'loadHistory',
+                    history: this.conversationHistory
+                });
+            }
+        }, 500);
 
         // Handle messages from the webview
         webviewView.webview.onDidReceiveMessage(async (data) => {
@@ -242,6 +429,58 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
                         });
                     }
                     break;
+
+                case 'getWorkspaceInfo':
+                    const workspaceInfo = await this.getWorkspaceInfo();
+                    webviewView.webview.postMessage({
+                        type: 'addMessage',
+                        message: {
+                            role: 'assistant',
+                            content: workspaceInfo
+                        }
+                    });
+                    break;
+
+                case 'searchProject':
+                    const searchQuery = data.value;
+                    const searchResults = await this.searchInProject(searchQuery);
+                    webviewView.webview.postMessage({
+                        type: 'addMessage',
+                        message: {
+                            role: 'assistant',
+                            content: searchResults
+                        }
+                    });
+                    break;
+
+                case 'saveAnalysis':
+                    const saveResult = await this.saveProjectAnalysis();
+                    webviewView.webview.postMessage({
+                        type: 'addMessage',
+                        message: {
+                            role: 'assistant',
+                            content: saveResult
+                        }
+                    });
+                    break;
+
+                case 'clearChat':
+                    this.conversationHistory = [];
+                    this.hasShownWelcome = false;
+                    await this._context.workspaceState.update('conversationHistory', []);
+                    await this._context.workspaceState.update('hasShownWelcome', false);
+                    webviewView.webview.postMessage({
+                        type: 'chatCleared'
+                    });
+                    break;
+
+                case 'loadHistory':
+                    // Send conversation history back to webview
+                    webviewView.webview.postMessage({
+                        type: 'loadHistory',
+                        history: this.conversationHistory
+                    });
+                    break;
             }
         });
     }
@@ -271,30 +510,44 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
             position: relative;
         }
 
-        .settings-btn {
+        .toolbar {
             position: fixed;
-            top: 12px;
-            right: 12px;
-            z-index: 100;
-            background: var(--vscode-sideBar-background);
-            border: 1px solid var(--vscode-panel-border);
-            padding: 6px;
+            top: 8px;
+            right: 8px;
+            z-index: 1000;
+            display: flex;
+            gap: 6px;
+        }
+
+        .toolbar-btn {
+            background: var(--vscode-button-background);
+            border: none;
+            padding: 8px;
             cursor: pointer;
-            color: var(--vscode-foreground);
+            color: var(--vscode-button-foreground);
             display: flex;
             align-items: center;
             justify-content: center;
-            border-radius: 6px;
+            border-radius: 4px;
             transition: all 0.2s ease;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+            width: 32px;
+            height: 32px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
         }
 
-        .settings-btn:hover {
-            background-color: var(--vscode-list-hoverBackground);
+        .toolbar-btn:hover {
+            background-color: var(--vscode-button-hoverBackground);
+            transform: scale(1.05);
         }
 
-        .settings-btn:active {
+        .toolbar-btn:active {
             transform: scale(0.95);
+        }
+
+        .toolbar-btn svg {
+            pointer-events: none;
+            width: 16px;
+            height: 16px;
         }
 
         .settings-modal {
@@ -444,10 +697,12 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
         .chat-container {
             flex: 1;
             overflow-y: auto;
+            overflow-x: hidden;
             padding: 56px 16px 16px;
             display: flex;
             flex-direction: column;
             gap: 12px;
+            max-width: 100%;
         }
 
         .message {
@@ -455,6 +710,8 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
             flex-direction: column;
             gap: 8px;
             animation: slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            max-width: 100%;
+            width: 100%;
         }
 
         @keyframes slideIn {
@@ -484,6 +741,12 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
             font-size: var(--vscode-font-size);
             font-family: var(--vscode-font-family);
             position: relative;
+            word-wrap: break-word;
+            word-break: break-word;
+            overflow-wrap: break-word;
+            white-space: pre-wrap;
+            max-width: 100%;
+            overflow-x: auto;
         }
 
         .message.user .message-content {
@@ -703,13 +966,20 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
     </style>
 </head>
 <body>
-    <button class="settings-btn" id="settingsBtn" title="Ayarlar">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-            <circle cx="3" cy="8" r="1.5"/>
-            <circle cx="8" cy="8" r="1.5"/>
-            <circle cx="13" cy="8" r="1.5"/>
-        </svg>
-    </button>
+    <div class="toolbar">
+        <button class="toolbar-btn" id="settingsBtn" title="Ayarlar">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                <circle cx="3" cy="8" r="1.5"/>
+                <circle cx="8" cy="8" r="1.5"/>
+                <circle cx="13" cy="8" r="1.5"/>
+            </svg>
+        </button>
+        <button class="toolbar-btn" id="searchBtn" title="🔍 Dosya Ara">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z"/>
+            </svg>
+        </button>
+    </div>
 
     <!-- Settings Modal -->
     <div class="settings-modal" id="settingsModal">
@@ -780,6 +1050,21 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
             </div>
 
             <button class="save-btn" id="saveBtn">💾 Kaydet</button>
+
+            <div class="settings-section" style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--vscode-panel-border);">
+                <label class="settings-label">⚡ Hızlı İşlemler</label>
+                <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 12px;">
+                    <button class="save-btn" id="showWorkspaceBtn" style="background-color: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground);">
+                        📁 Workspace Bilgisi Göster
+                    </button>
+                    <button class="save-btn" id="saveAnalysisBtn" style="background-color: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground);">
+                        💾 Analizi agents.md'ye Kaydet
+                    </button>
+                    <button class="save-btn" id="clearChatBtn" style="background-color: #d32f2f; color: white;">
+                        🗑️ Sohbeti Temizle
+                    </button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -820,6 +1105,7 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
         const settingsBtn = document.getElementById('settingsBtn');
+        const searchBtn = document.getElementById('searchBtn');
         const settingsModal = document.getElementById('settingsModal');
         const closeBtn = document.getElementById('closeBtn');
         const saveBtn = document.getElementById('saveBtn');
@@ -827,12 +1113,36 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
         const modelSelect = document.getElementById('modelSelect');
         const apiEndpointInput = document.getElementById('apiEndpointInput');
         const loadingIndicator = document.getElementById('loadingIndicator');
+        const showWorkspaceBtn = document.getElementById('showWorkspaceBtn');
+        const saveAnalysisBtn = document.getElementById('saveAnalysisBtn');
+        const clearChatBtn = document.getElementById('clearChatBtn');
 
         // Load saved settings
         const state = vscode.getState() || {};
         if (state.apiKey) apiKeyInput.value = state.apiKey;
         if (state.model) modelSelect.value = state.model;
         if (state.apiEndpoint) apiEndpointInput.value = state.apiEndpoint;
+
+        // Load conversation history on startup
+        vscode.postMessage({ type: 'loadHistory' });
+
+        // Search button handler - show in chat
+        searchBtn.addEventListener('click', () => {
+            // Clear empty state if present
+            const emptyState = chatContainer.querySelector('.empty-state');
+            if (emptyState) {
+                emptyState.remove();
+            }
+
+            // Add a system message asking for search query
+            addMessageToChat({
+                role: 'assistant',
+                content: '🔍 Proje araması yapmak için dosya adını mesaj olarak yazın.\nÖrnek: "Button.tsx" veya "api" gibi...'
+            });
+
+            // Focus on input
+            messageInput.focus();
+        });
 
         // Settings modal handlers
         settingsBtn.addEventListener('click', () => {
@@ -869,6 +1179,24 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
                 saveBtn.style.backgroundColor = '';
                 settingsModal.classList.remove('show');
             }, 1500);
+        });
+
+        // Quick action buttons
+        showWorkspaceBtn.addEventListener('click', () => {
+            settingsModal.classList.remove('show');
+            vscode.postMessage({ type: 'getWorkspaceInfo' });
+        });
+
+        saveAnalysisBtn.addEventListener('click', () => {
+            settingsModal.classList.remove('show');
+            vscode.postMessage({ type: 'saveAnalysis' });
+        });
+
+        clearChatBtn.addEventListener('click', () => {
+            if (confirm('Sohbet geçmişini silmek istediğinizden emin misiniz?')) {
+                settingsModal.classList.remove('show');
+                vscode.postMessage({ type: 'clearChat' });
+            }
         });
 
         // Auto-resize textarea
@@ -941,6 +1269,26 @@ class ClineViewProvider implements vscode.WebviewViewProvider {
                     } else {
                         loadingIndicator.classList.remove('show');
                     }
+                    break;
+                case 'loadHistory':
+                    // Clear empty state and load messages
+                    const emptyState = chatContainer.querySelector('.empty-state');
+                    if (emptyState && message.history && message.history.length > 0) {
+                        emptyState.remove();
+                    }
+                    if (message.history && message.history.length > 0) {
+                        message.history.forEach(msg => addMessageToChat(msg));
+                    }
+                    break;
+                case 'chatCleared':
+                    // Clear all messages and show empty state
+                    chatContainer.innerHTML = \`
+                        <div class="empty-state">
+                            <div class="empty-state-icon">💬</div>
+                            <h2>Hoş Geldiniz!</h2>
+                            <p>Bir şey sormak için aşağıdaki metin kutusuna yazın ve Enter'a basın.</p>
+                        </div>
+                    \`;
                     break;
             }
         });
