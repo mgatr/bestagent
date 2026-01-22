@@ -1,0 +1,54 @@
+{
+  "name": "bestagent",
+  "displayName": "BestAgent",
+  "description": "AI asistan arayüzü",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cline-assistant.openChat",
+        "title": "Open BestAgent",
+        "icon": "$(comment-discussion)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cline-assistant",
+          "title": "BestAgent",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "views": {
+      "cline-assistant": [
+        {
+          "type": "webview",
+          "id": "cline-assistant.chatView",
+          "name": "Chat"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.x",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
